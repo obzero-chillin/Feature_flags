@@ -1,41 +1,99 @@
+const crypto = require('crypto');
+
 class FlagService {
-  constructor(db_type, db, table = 'feature_flags') {
-    this.db_type = db_type;
+  constructor({ dbType, db, redis, table = 'feature_flags' }) {
+    const ALLOWED_TABLES = new Set(['feature_flags']);
+    this.table = ALLOWED_TABLES.has(table) ? table : 'feature_flags';
+
+    this.dbType = dbType;
     this.db = db;
-    this.table = table;
+    this.redis = redis;
   }
 
   async getFlag(flagName) {
-    switch (this.db_type) {
-      case 'mongodb': {
-        return await this.db
-          .collection(this.table)
-          .findOne(
-            { name: flagName },
-            { projection: { enabled: 1, rollout_percentage: 1 } }
-          );
-      }
+    const cacheKey = `flag:${flagName}`;
 
-      case 'mysql': {
-        const [rows] = await this.db.query(
-          `SELECT enabled, rollout_percentage FROM ${this.table} WHERE name = ?`,
-          [flagName]
-        );
-        return rows[0] ?? null;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) {
+        try {
+          return JSON.parse(cached);
+        } catch {
+          await this.redis.del(cacheKey);
+        }
       }
-
-      default:
-        throw new Error('Unsupported db type');
+    } catch (err) {
+      console.error('Redis get failed:', err.message);
     }
+
+    let flag = null;
+
+    try {
+      switch (this.dbType) {
+        case 'postgres': {
+          const result = await this.db.query(
+            `SELECT enabled, rollout_percentage FROM ${this.table} WHERE name = $1 LIMIT 1`,
+            [flagName]
+          );
+          flag = result.rows[0] ?? null;
+          break;
+        }
+
+        case 'mysql': {
+          const [rows] = await this.db.query(
+            `SELECT enabled, rollout_percentage FROM ${this.table} WHERE name = ? LIMIT 1`,
+            [flagName]
+          );
+          flag = rows[0] ?? null;
+          break;
+        }
+
+        default:
+          throw new Error('Unsupported DB type');
+      }
+    } catch (err) {
+      console.error('DB query failed:', err.message);
+      return null;
+    }
+
+    if (flag) {
+      flag.enabled = Boolean(flag.enabled);
+      flag.rollout_percentage = Number(flag.rollout_percentage) || 0;
+
+      try {
+        const ttl = 30 + Math.floor(Math.random() * 10);
+        await this.redis.set(cacheKey, JSON.stringify(flag), { EX: ttl });
+      } catch (err) {
+        console.error('Redis set failed:', err.message);
+      }
+    }
+
+    return flag;
   }
 
-  async isEnabled(flagName, context) {
-    const flag = await this.getFlag(flagName);
+  isEnabledForUser(userId, rollout) {
+    const hash = crypto
+      .createHash('sha256')
+      .update(String(userId))
+      .digest()
+      .readUInt32BE(0);
 
+    return (hash % 100) < rollout;
+  }
+
+  async isEnabled(flagName, context = {}) {
+    const flag = await this.getFlag(flagName);
     if (!flag) return false;
     if (!flag.enabled) return false;
     if (flag.rollout_percentage >= 100) return true;
 
-    return context.userId % 100 < flag.rollout_percentage;
+    if (!context.userId) return false;
+
+    return this.isEnabledForUser(
+      context.userId,
+      flag.rollout_percentage
+    );
   }
 }
+
+module.exports = FlagService;
