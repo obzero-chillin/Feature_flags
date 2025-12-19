@@ -1,3 +1,5 @@
+In a nutshell, it acts as a toggle for features. Say you have an app and you deliver an update, say a new ui. If the new UI is broken you don't have to shut it down and have the app down, instead you can "flag" the update and toggle it to the old ui. Helps with user experience.
+
 A lightweight, production-ready feature flag service for Node.js applications with Redis caching and support for PostgreSQL and MySQL. Designed for gradual rollouts, safe defaults, and minimal operational surprises.
 
 Features:
